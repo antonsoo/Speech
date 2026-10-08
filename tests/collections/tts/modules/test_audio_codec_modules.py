@@ -229,6 +229,53 @@ class TestResidualVectorQuantizer:
         self.num_examples = 10
 
     @pytest.mark.unit
+    @pytest.mark.parametrize('num_codebooks, num_groups', [(1, 1), (4, 1), (8, 1), (4, 2), (8, 2)])
+    def test_rvq_reconstruction_gradient(self, num_codebooks, num_groups):
+        torch.manual_seed(0)
+        kwargs = dict(num_codebooks=num_codebooks, codebook_size=4, codebook_dim=4, kmeans_iters=2)
+        if num_groups == 1:
+            rvq = ResidualVectorQuantizer(**kwargs)
+        else:
+            rvq = GroupResidualVectorQuantizer(num_groups=num_groups, **kwargs)
+        rvq.train()
+        inputs = torch.randn(2, 4, 6, requires_grad=True)
+        input_len = torch.tensor([6, 6])
+        dequantized, _, _ = rvq(inputs=inputs, input_len=input_len)
+
+        # The straight-through estimator should pass each reconstruction gradient once.
+        output_grad = torch.randn_like(dequantized)
+        input_grad = torch.autograd.grad(dequantized, inputs, grad_outputs=output_grad)[0]
+        torch.testing.assert_close(input_grad, output_grad)
+
+    @pytest.mark.unit
+    def test_rvq_commitment_gradient(self):
+        torch.manual_seed(0)
+        rvq = ResidualVectorQuantizer(num_codebooks=4, codebook_size=4, codebook_dim=4, kmeans_iters=2)
+        rvq.train()
+        inputs = torch.randn(2, 4, 6, requires_grad=True)
+        input_len = torch.tensor([6, 6])
+        codes = []
+        hooks = [
+            codebook.register_forward_hook(lambda module, args, output: codes.append(output[0].detach()))
+            for codebook in rvq.codebooks
+        ]
+        try:
+            dequantized, _, commit_loss = rvq(inputs=inputs, input_len=input_len)
+        finally:
+            for hook in hooks:
+                hook.remove()
+
+        # Every residual commitment loss must still contribute to the encoder gradient.
+        residual = inputs.detach().transpose(1, 2)
+        expected_grad = torch.zeros_like(residual)
+        for code in codes:
+            residual = residual - code
+            expected_grad += 2 * residual / inputs.numel()
+        input_grad = torch.autograd.grad(commit_loss, inputs)[0]
+        torch.testing.assert_close(input_grad, expected_grad.transpose(1, 2))
+        torch.testing.assert_close(dequantized, torch.stack(codes).sum(dim=0).transpose(1, 2))
+
+    @pytest.mark.unit
     @pytest.mark.parametrize('num_codebooks', [1, 4])
     def test_rvq_eval(self, num_codebooks: int):
         """Simple test to confirm that the RVQ module can be instantiated and run,

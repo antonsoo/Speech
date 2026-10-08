@@ -778,7 +778,6 @@ class ResidualVectorQuantizer(VectorQuantizerBase):
                 commit_loss = commit_loss + commit_loss_i
 
                 residual = residual - dequantized_i_const
-                dequantized_i = residual + (dequantized_i - residual).detach()
             else:
                 residual = residual - dequantized_i
 
@@ -788,6 +787,9 @@ class ResidualVectorQuantizer(VectorQuantizerBase):
         # [N, B, T], first dimension is number of codebooks
         indices = torch.stack(index_list)
         dequantized = rearrange(dequantized, "B T D -> B D T")
+        if self.training:
+            # Pass the reconstruction gradient through once, independently of the number of codebooks.
+            dequantized = inputs + (dequantized - inputs).detach()
         return dequantized, indices, commit_loss
 
     @typecheck(
