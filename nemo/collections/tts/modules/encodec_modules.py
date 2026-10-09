@@ -547,7 +547,7 @@ class EuclideanCodebook(NeuralModule):
         decay: Decay for exponential moving average over the codebooks.
         threshold_ema_dead_code: Threshold for dead code expiration.
             During every iteration, replace codes with exponential moving average cluster size less than threshold
-            with randomly selected values from the current batch.
+            with randomly selected values from the current batch and reset their EMA cluster size to the threshold.
         kmeans_iters: Optional int, if provided codes will be initialized from the centroids learned from
             kmeans_iters iterations of k-means clustering on the first training batch.
     """
@@ -599,9 +599,12 @@ class EuclideanCodebook(NeuralModule):
             return
 
         samples = _sample_vectors(samples=inputs, num_sample=self.codebook_size)
+        # Reset the EMA statistics too, so _update_codes does not overwrite the replacements with stale centroids.
+        self.cluster_size.data.masked_fill_(expired_codes, self.threshold_ema_dead_code)
         expired_codes = rearrange(expired_codes, "K -> K ()")
         modified_codes = torch.where(expired_codes, samples, self.codes)
         self.codes.data.copy_(modified_codes)
+        self.codes_avg.data.copy_(torch.where(expired_codes, samples * self.threshold_ema_dead_code, self.codes_avg))
 
         broadcast_tensors(self.buffers())
 

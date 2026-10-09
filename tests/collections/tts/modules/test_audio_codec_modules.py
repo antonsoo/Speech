@@ -31,7 +31,11 @@ from nemo.collections.tts.modules.audio_codec_modules import (
     ResNetSpeakerEncoder,
     get_down_sample_padding,
 )
-from nemo.collections.tts.modules.encodec_modules import GroupResidualVectorQuantizer, ResidualVectorQuantizer
+from nemo.collections.tts.modules.encodec_modules import (
+    EuclideanCodebook,
+    GroupResidualVectorQuantizer,
+    ResidualVectorQuantizer,
+)
 
 
 class TestAudioCodecModules:
@@ -217,6 +221,48 @@ class TestAudioCodecModules:
         assert torch.all(out[0, :, out_len_1:] == 0.0)
         assert torch.all(out[1, :, :out_len_2] != 0.0)
         assert torch.all(out[1, :, out_len_2:] == 0.0)
+
+
+class TestEuclideanCodebookExpiry:
+    @pytest.mark.run_only_on('CPU')
+    @pytest.mark.unit
+    @pytest.mark.parametrize('decay', [0.5, 0.99])
+    @pytest.mark.parametrize('threshold', [None, 0.0, 2.0, 3.5])
+    def test_expired_code_survives_ema_update(self, decay, threshold):
+        codebook = EuclideanCodebook(
+            codebook_size=2,
+            codebook_dim=1,
+            decay=decay,
+            threshold_ema_dead_code=threshold,
+            kmeans_iters=None,
+        )
+        codebook.codes.copy_(torch.tensor([[0.0], [100.0]]))
+        codebook.cluster_size.copy_(torch.tensor([10.0, 1.0]))
+        codebook.codes_avg.copy_(torch.tensor([[0.0], [100.0]]))
+        inputs = torch.full((1, 4, 1), 2.0)
+        lengths = torch.tensor([4])
+
+        dequantized, indices = codebook(inputs=inputs, input_len=lengths)
+
+        # The current batch is quantized before updating or replacing codes.
+        torch.testing.assert_close(indices, torch.zeros_like(indices))
+        torch.testing.assert_close(dequantized, torch.zeros_like(dequantized))
+        torch.testing.assert_close(codebook.cluster_size[0], torch.tensor(10 * decay + 4 * (1 - decay)))
+        torch.testing.assert_close(codebook.codes_avg[0, 0], torch.tensor(8 * (1 - decay)))
+
+        if threshold:
+            # Every sampled replacement is 2.0. The next EMA update must retain
+            # this centroid, with its sum and count describing the same code.
+            torch.testing.assert_close(codebook.codes[1, 0], torch.tensor(2.0), rtol=1e-5, atol=1e-5)
+            torch.testing.assert_close(codebook.cluster_size[1], torch.tensor(threshold * decay))
+            torch.testing.assert_close(codebook.codes_avg[1, 0], torch.tensor(2 * threshold * decay))
+            expected_indices = torch.ones_like(indices)
+        else:
+            torch.testing.assert_close(codebook.codes[1, 0], torch.tensor(100.0), rtol=1e-4, atol=1e-4)
+            expected_indices = torch.zeros_like(indices)
+
+        next_indices = codebook.encode(inputs=inputs, input_len=lengths)
+        torch.testing.assert_close(next_indices, expected_indices)
 
 
 class TestResidualVectorQuantizer:
