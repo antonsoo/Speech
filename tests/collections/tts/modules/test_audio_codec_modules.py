@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from copy import deepcopy
+
 import pytest
 import torch
 
@@ -31,7 +33,11 @@ from nemo.collections.tts.modules.audio_codec_modules import (
     ResNetSpeakerEncoder,
     get_down_sample_padding,
 )
-from nemo.collections.tts.modules.encodec_modules import GroupResidualVectorQuantizer, ResidualVectorQuantizer
+from nemo.collections.tts.modules.encodec_modules import (
+    EuclideanCodebook,
+    GroupResidualVectorQuantizer,
+    ResidualVectorQuantizer,
+)
 
 
 class TestAudioCodecModules:
@@ -217,6 +223,62 @@ class TestAudioCodecModules:
         assert torch.all(out[0, :, out_len_1:] == 0.0)
         assert torch.all(out[1, :, :out_len_2] != 0.0)
         assert torch.all(out[1, :, out_len_2:] == 0.0)
+
+
+class TestEuclideanCodebookPadding:
+    @pytest.mark.run_only_on('CPU')
+    @pytest.mark.unit
+    @pytest.mark.parametrize('initialize', [False, True])
+    def test_no_valid_frames_leave_codebook_unchanged(self, initialize):
+        codebook = EuclideanCodebook(codebook_size=3, codebook_dim=2, kmeans_iters=3 if initialize else None)
+        state = deepcopy(codebook.state_dict())
+        dequantized, indices = codebook(inputs=torch.ones(2, 4, 2), input_len=torch.tensor([0, 0]))
+        assert torch.count_nonzero(dequantized) == 0
+        assert torch.count_nonzero(indices) == 0
+        for name, value in codebook.state_dict().items():
+            torch.testing.assert_close(value, state[name])
+
+    @pytest.mark.run_only_on('CPU')
+    @pytest.mark.unit
+    @pytest.mark.parametrize('initialize', [False, True])
+    @pytest.mark.parametrize('lengths', [[4, 4], [3, 2], [3, 0]])
+    @pytest.mark.parametrize('padding_value', [0.0, 99.0])
+    def test_training_ignores_padded_frames(self, initialize, lengths, padding_value):
+        torch.manual_seed(11)
+        codebook = EuclideanCodebook(
+            codebook_size=3,
+            codebook_dim=2,
+            decay=0.5,
+            threshold_ema_dead_code=None,
+            kmeans_iters=3 if initialize else None,
+        )
+        if initialize:
+            # Isolate k-means initialization from the following training update.
+            codebook.eval()
+        else:
+            codebook.codes.copy_(torch.tensor([[-1.0, 0.0], [1.0, 2.0], [3.0, 4.0]]))
+            codebook.codes_avg.copy_(codebook.codes)
+            codebook.cluster_size.fill_(1)
+        reference = deepcopy(codebook)
+        inputs = torch.arange(16, dtype=torch.float32).reshape(2, 4, 2) / 4
+        for batch_index, length in enumerate(lengths):
+            inputs[batch_index, length:] = padding_value
+        packed = torch.cat([row[:length] for row, length in zip(inputs, lengths)], dim=0).unsqueeze(0)
+
+        torch.manual_seed(7)
+        dequantized, indices = codebook(inputs=inputs, input_len=torch.tensor(lengths))
+        torch.manual_seed(7)
+        expected, expected_indices = reference(inputs=packed, input_len=torch.tensor([sum(lengths)]))
+
+        for name, state in codebook.state_dict().items():
+            torch.testing.assert_close(state, reference.state_dict()[name], msg=f'{name} includes padding')
+        valid_outputs = torch.cat([row[:length] for row, length in zip(dequantized, lengths)], dim=0)
+        valid_indices = torch.cat([row[:length] for row, length in zip(indices, lengths)], dim=0)
+        torch.testing.assert_close(valid_outputs, expected[0])
+        torch.testing.assert_close(valid_indices, expected_indices[0])
+        for batch_index, length in enumerate(lengths):
+            assert torch.count_nonzero(dequantized[batch_index, length:]) == 0
+            assert torch.count_nonzero(indices[batch_index, length:]) == 0
 
 
 class TestResidualVectorQuantizer:

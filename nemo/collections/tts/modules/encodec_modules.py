@@ -583,11 +583,13 @@ class EuclideanCodebook(NeuralModule):
         if self.initialized:
             return
 
-        codes, cluster_size = _k_means(samples=data, num_clusters=self.codebook_size, num_iters=self.kmeans_iters)
-        self.codes.data.copy_(codes)
-        self.codes_avg.data.copy_(codes.clone())
-        self.cluster_size.data.copy_(cluster_size)
-        self.initialized.data.copy_(Tensor([True]))
+        if data.shape[0] > 0:
+            codes, cluster_size = _k_means(samples=data, num_clusters=self.codebook_size, num_iters=self.kmeans_iters)
+            self.codes.data.copy_(codes)
+            self.codes_avg.data.copy_(codes.clone())
+            self.cluster_size.data.copy_(cluster_size)
+            self.initialized.data.copy_(Tensor([True]))
+        # Empty workers must still participate in the rank-zero broadcast.
         broadcast_tensors(self.buffers())
 
     def _expire_codes(self, inputs: Tensor) -> None:
@@ -598,11 +600,13 @@ class EuclideanCodebook(NeuralModule):
         if not torch.any(expired_codes):
             return
 
-        samples = _sample_vectors(samples=inputs, num_sample=self.codebook_size)
-        expired_codes = rearrange(expired_codes, "K -> K ()")
-        modified_codes = torch.where(expired_codes, samples, self.codes)
-        self.codes.data.copy_(modified_codes)
+        if inputs.shape[0] > 0:
+            samples = _sample_vectors(samples=inputs, num_sample=self.codebook_size)
+            expired_codes = rearrange(expired_codes, "K -> K ()")
+            modified_codes = torch.where(expired_codes, samples, self.codes)
+            self.codes.data.copy_(modified_codes)
 
+        # Empty workers must still participate in the rank-zero broadcast.
         broadcast_tensors(self.buffers())
 
     def _update_codes(self, inputs: Tensor, indices: Tensor) -> None:
@@ -649,7 +653,9 @@ class EuclideanCodebook(NeuralModule):
     @typecheck()
     def forward(self, inputs, input_len):
         input_flat = rearrange(inputs, "B T D -> (B T) D")
-        self._init_codes(input_flat)
+        valid = torch.arange(inputs.shape[1], device=inputs.device)[None, :] < input_len[:, None]
+        input_valid = inputs[valid]
+        self._init_codes(input_valid)
         # [(B T)]
         indices_flat = self._quantize(inputs=input_flat)
         # [B, T]
@@ -659,8 +665,9 @@ class EuclideanCodebook(NeuralModule):
 
         if self.training:
             # We do expiry of codes here because buffers are in sync and all the workers will make the same decision.
-            self._expire_codes(inputs=input_flat)
-            self._update_codes(inputs=input_flat, indices=indices_flat)
+            self._expire_codes(inputs=input_valid)
+            if input_valid.shape[0] > 0:
+                self._update_codes(inputs=input_valid, indices=indices[valid])
 
         dequantized = _mask_3d(dequantized, input_len)
         indices = mask_sequence_tensor(indices, input_len)
