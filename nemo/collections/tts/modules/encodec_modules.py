@@ -585,7 +585,7 @@ class EuclideanCodebook(NeuralModule):
 
         codes, cluster_size = _k_means(samples=data, num_clusters=self.codebook_size, num_iters=self.kmeans_iters)
         self.codes.data.copy_(codes)
-        self.codes_avg.data.copy_(codes.clone())
+        self.codes_avg.data.copy_(codes * rearrange(cluster_size, "K -> K ()"))
         self.cluster_size.data.copy_(cluster_size)
         self.initialized.data.copy_(Tensor([True]))
         broadcast_tensors(self.buffers())

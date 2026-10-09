@@ -31,7 +31,11 @@ from nemo.collections.tts.modules.audio_codec_modules import (
     ResNetSpeakerEncoder,
     get_down_sample_padding,
 )
-from nemo.collections.tts.modules.encodec_modules import GroupResidualVectorQuantizer, ResidualVectorQuantizer
+from nemo.collections.tts.modules.encodec_modules import (
+    EuclideanCodebook,
+    GroupResidualVectorQuantizer,
+    ResidualVectorQuantizer,
+)
 
 
 class TestAudioCodecModules:
@@ -217,6 +221,39 @@ class TestAudioCodecModules:
         assert torch.all(out[0, :, out_len_1:] == 0.0)
         assert torch.all(out[1, :, :out_len_2] != 0.0)
         assert torch.all(out[1, :, out_len_2:] == 0.0)
+
+
+class TestEuclideanCodebookInitialization:
+    @pytest.mark.run_only_on('CPU')
+    @pytest.mark.unit
+    @pytest.mark.parametrize('num_frames', [1, 8, 32])
+    @pytest.mark.parametrize('codebook_size', [1, 4])
+    def test_initial_cluster_sums_conserve_input(self, num_frames, codebook_size):
+        codebook = EuclideanCodebook(codebook_size=codebook_size, codebook_dim=2, kmeans_iters=3).eval()
+        inputs = torch.tensor([2.0, -3.0]).repeat(1, num_frames, 1)
+
+        codebook(inputs=inputs, input_len=torch.tensor([num_frames]))
+
+        torch.testing.assert_close(codebook.cluster_size.sum(), torch.tensor(float(num_frames)))
+        torch.testing.assert_close(codebook.codes_avg.sum(dim=0), inputs.sum(dim=(0, 1)))
+        assert torch.count_nonzero(codebook.codes_avg[codebook.cluster_size == 0]) == 0
+
+    @pytest.mark.run_only_on('CPU')
+    @pytest.mark.unit
+    @pytest.mark.parametrize('num_frames', [1, 8, 32])
+    @pytest.mark.parametrize('decay', [0.0, 0.5, 0.99])
+    def test_constant_centroid_survives_first_training_update(self, num_frames, decay):
+        codebook = EuclideanCodebook(
+            codebook_size=1, codebook_dim=2, decay=decay, kmeans_iters=3, threshold_ema_dead_code=None
+        )
+        inputs = torch.tensor([2.0, -3.0]).repeat(1, num_frames, 1)
+
+        dequantized, _ = codebook(inputs=inputs, input_len=torch.tensor([num_frames]))
+
+        # An unchanged batch must not pull its own k-means centroid toward zero.
+        torch.testing.assert_close(dequantized, inputs)
+        torch.testing.assert_close(codebook.codes, inputs[:, 0])
+        torch.testing.assert_close(codebook.codes_avg.sum(dim=0), inputs.sum(dim=(0, 1)))
 
 
 class TestResidualVectorQuantizer:
